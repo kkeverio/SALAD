@@ -21,6 +21,11 @@ from torchvision.ops.focal_loss import sigmoid_focal_loss
 from logger import log
 from dice_loss import DiceLoss
 from argparser import get_argparse
+from relation_branch import (
+    RelationClassEmbedding,
+    PairRelationModel,
+    build_relation_pair_batch,
+)
 
 # constants
 seed = 42
@@ -139,6 +144,35 @@ def main():
     comp_ae = AutoEncoder({})
     comp_unet = UNet({})
 
+    relation_branch_enabled = config.enable_relation_branch
+    relation_class_embedding = None
+    pair_relation_model = None
+    if relation_branch_enabled:
+        relation_class_embedding = RelationClassEmbedding(
+            config.relation_num_classes, config.relation_embedding_dim)
+        pair_relation_model = PairRelationModel(
+            config.relation_embedding_dim, config.relation_hidden_dim)
+
+    resume_from = config.resume_from
+
+    def maybe_resume(module, filename):
+        if not resume_from:
+            return module
+        ckpt_path = os.path.join(resume_from, filename)
+        if os.path.exists(ckpt_path):
+            return torch.load(ckpt_path)
+        return module
+
+    student = maybe_resume(student, 'student_tmp.pth')
+    autoencoder = maybe_resume(autoencoder, 'autoencoder_tmp.pth')
+    comp_ae = maybe_resume(comp_ae, 'comp_autoencoder_tmp.pth')
+    comp_unet = maybe_resume(comp_unet, 'comp_unet_tmp.pth')
+    if relation_branch_enabled:
+        relation_class_embedding = maybe_resume(
+            relation_class_embedding, 'relation_embedding_tmp.pth')
+        pair_relation_model = maybe_resume(
+            pair_relation_model, 'pair_relation_model_tmp.pth')
+
 
     # teacher frozen
     teacher.eval()
@@ -146,6 +180,9 @@ def main():
     autoencoder.train()
     comp_ae.train()
     comp_unet.train()
+    if relation_branch_enabled:
+        relation_class_embedding.train()
+        pair_relation_model.train()
 
     if on_gpu:
         teacher.cuda()
@@ -154,12 +191,22 @@ def main():
         # comp_disc.cuda()
         comp_ae.cuda()
         comp_unet.cuda()
+        if relation_branch_enabled:
+            relation_class_embedding.cuda()
+            pair_relation_model.cuda()
 
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
 
-    optimizer = torch.optim.Adam([{"params": list(student.parameters()) + list(autoencoder.parameters())},
-                                  {"params": list(comp_ae.parameters()) + list(comp_unet.parameters()), "lr":1e-5}],
-                                 lr=1e-4, weight_decay=1e-5)
+    optimizer_param_groups = [
+        {"params": list(student.parameters()) + list(autoencoder.parameters())},
+        {"params": list(comp_ae.parameters()) + list(comp_unet.parameters()), "lr": 1e-5}
+    ]
+    if relation_branch_enabled:
+        optimizer_param_groups.append({
+            "params": list(relation_class_embedding.parameters()) + list(pair_relation_model.parameters())
+        })
+
+    optimizer = torch.optim.Adam(optimizer_param_groups, lr=1e-4, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=int(0.95 * config.train_steps), gamma=0.1)
     
@@ -184,9 +231,11 @@ def main():
         image_st, image_ae = img
         image_st = normalize(image_st)
         image_ae = normalize(image_ae)
-        anom_seg = torch.cat([anom_seg, seg],dim=0)
-        mask = torch.cat([mask,torch.zeros_like(mask)],dim=0)
-        seg = torch.cat([seg, seg],dim=0)
+        clean_seg_maps = seg
+        anomaly_seg_maps = anom_seg
+        anom_seg = torch.cat([anomaly_seg_maps, clean_seg_maps], dim=0)
+        mask = torch.cat([mask, torch.zeros_like(mask)], dim=0)
+        seg = torch.cat([clean_seg_maps, clean_seg_maps], dim=0)
         seg = seg.argmax(dim=1)
         if on_gpu:
             image_st = image_st.cuda()
@@ -232,15 +281,36 @@ def main():
 
         loss_total = loss_st + loss_ae + loss_stae + loss_comp_recon + loss_comp_mask
 
+        relation_loss_value = 0.0
+        if relation_branch_enabled:
+            pair_indices, pair_labels = build_relation_pair_batch(
+                clean_seg_maps, anomaly_seg_maps, config.relation_max_pairs,
+                device=image_st.device if on_gpu else None)
+            if pair_indices is not None:
+                pair_features = relation_class_embedding(pair_indices)
+                relation_logits = pair_relation_model(pair_features)
+                relation_loss = F.binary_cross_entropy_with_logits(
+                    relation_logits, pair_labels)
+                loss_total = loss_total + config.relation_lambda * relation_loss
+                relation_loss_value = relation_loss.item()
+
         optimizer.zero_grad()
         loss_total.backward()
         optimizer.step()
         scheduler.step()
 
         if iteration % 10 == 0:
-            tqdm_obj.set_description(
-                # "Current loss: {:.4f}".format(loss_total.item()))
-                "Current loss: {:.4f}, comp recon loss {:.4f}, comp disc loss {:.4f}".format(loss_total.item(), loss_comp_recon.item(), loss_comp_mask.item()))
+            if relation_branch_enabled:
+                desc = (
+                    "Current loss: {:.4f}, comp recon loss {:.4f}, comp disc loss {:.4f}, relation loss {:.4f}".format(
+                        loss_total.item(), loss_comp_recon.item(), loss_comp_mask.item(), relation_loss_value)
+                )
+            else:
+                desc = (
+                    "Current loss: {:.4f}, comp recon loss {:.4f}, comp disc loss {:.4f}".format(
+                        loss_total.item(), loss_comp_recon.item(), loss_comp_mask.item())
+                )
+            tqdm_obj.set_description(desc)
 
 
         if iteration % 10000 == 0:
@@ -254,6 +324,11 @@ def main():
                                                  'comp_autoencoder_tmp.pth'))
             torch.save(comp_unet, os.path.join(train_output_dir,
                                                  'comp_unet_tmp.pth'))
+            if relation_branch_enabled:
+                torch.save(relation_class_embedding, os.path.join(train_output_dir,
+                                                 'relation_embedding_tmp.pth'))
+                torch.save(pair_relation_model, os.path.join(train_output_dir,
+                                                 'pair_relation_model_tmp.pth'))
 
         if iteration % 10000 == 0 and iteration > 0:
             # run intermediate evaluation
@@ -262,6 +337,9 @@ def main():
             autoencoder.eval()
             comp_ae.eval()
             comp_unet.eval()
+            if relation_branch_enabled:
+                relation_class_embedding.eval()
+                pair_relation_model.eval()
             # comp_disc.eval()
             train_set.train = False
 
@@ -298,6 +376,9 @@ def main():
             autoencoder.train()
             comp_ae.train()
             comp_unet.train()
+            if relation_branch_enabled:
+                relation_class_embedding.train()
+                pair_relation_model.train()
             train_set.train = True
 
     train_set.train = False
@@ -306,6 +387,9 @@ def main():
     autoencoder.eval()
     comp_ae.eval()
     comp_unet.eval()
+    if relation_branch_enabled:
+        relation_class_embedding.eval()
+        pair_relation_model.eval()
 
     torch.save(teacher, os.path.join(train_output_dir, 'teacher_final.pth'))
     torch.save(student, os.path.join(train_output_dir, 'student_final.pth'))
@@ -315,6 +399,11 @@ def main():
                                                  'comp_autoencoder_final.pth'))
     torch.save(comp_unet, os.path.join(train_output_dir,
                                             'comp_unet_final.pth'))
+    if relation_branch_enabled:
+        torch.save(relation_class_embedding, os.path.join(train_output_dir,
+                                             'relation_embedding_final.pth'))
+        torch.save(pair_relation_model, os.path.join(train_output_dir,
+                                             'pair_relation_model_final.pth'))
 
 
     q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
