@@ -1,11 +1,22 @@
-from argparser import get_argparse
 import os
+
 import torch
 from salad_dataset import ImageFolderWithoutTarget, ImageFolderWithPath, ImageFolderWithoutTargetWithSeg, ImageFolderWithPathWithSeg
-from train_salad import teacher_normalization, map_normalization, score_normalization, extract_features_mahalanobis, test, map_normalization_mahalanobis, train_transform, default_transform
+from train_salad import (
+    teacher_normalization,
+    map_normalization,
+    score_normalization,
+    extract_features_mahalanobis,
+    test,
+    map_normalization_mahalanobis,
+    train_transform,
+    default_transform,
+    relation_score_normalization,
+)
 from logger import log
 from torchvision import transforms
 from torch.utils.data import DataLoader
+from argparser import get_argparse
 
 seed = 42
 on_gpu = torch.cuda.is_available()
@@ -69,6 +80,7 @@ def test_all():
     student = torch.load(f"{train_output_dir}/student_final.pth")
     comp_ae = torch.load(f"{train_output_dir}/comp_autoencoder_final.pth")
     comp_unet = torch.load(f"{train_output_dir}/comp_unet_final.pth")
+    relation_model = torch.load(f"{train_output_dir}/relation_model_final.pth")
     
 
     # teacher frozen
@@ -79,12 +91,14 @@ def test_all():
         autoencoder.cuda()
         comp_ae.cuda()
         comp_unet.cuda()
+        relation_model.cuda()
 
     teacher.eval()
     student.eval()
     autoencoder.eval()
     comp_ae.eval()
     comp_unet.eval()
+    relation_model.eval()
 
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)    
 
@@ -96,21 +110,35 @@ def test_all():
         validation_loader=validation_loader, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet,
         autoencoder=autoencoder, teacher_mean=teacher_mean,
         teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_ae_end=q_ae_end, desc='Final score normalization')
+    relation_score_mean, relation_score_std = relation_score_normalization(
+        validation_loader=validation_loader,
+        relation_model=relation_model,
+        min_component_area=config.relation_min_component_area,
+        component_connectivity=config.relation_component_connectivity,
+        reduction=config.relation_score_reduction,
+        desc='Final relation score normalization',
+    )
     feature_vectors_mean, feature_vectors_covinv, feature_vectors_mean_seg, feature_vectors_covinv_seg, feature_vectors_mean_seg_area, feature_vectors_covinv_seg_area = extract_features_mahalanobis(train_loader, train_set, student, teacher_mean, teacher_std)
     q_start_mah, q_end_mah = map_normalization_mahalanobis(validation_loader, student, teacher_mean, teacher_std, feature_vectors_covinv, feature_vectors_mean, feature_vectors_covinv_seg, feature_vectors_mean_seg, feature_vectors_covinv_seg_area, feature_vectors_mean_seg_area)
-    auc, auc_img, auc_mlp, auc_comp = test(
-        test_set=test_set, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet,
+    auc, auc_img, auc_mlp, auc_comp, auc_rel = test(
+        test_set=test_set, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet, relation_model=relation_model,
         autoencoder=autoencoder, teacher_mean=teacher_mean,
         teacher_std=teacher_std, feature_vectors_covinv=feature_vectors_covinv, feature_vectors_mean=feature_vectors_mean, feature_vectors_covinv_seg=feature_vectors_covinv_seg, feature_vectors_mean_seg=feature_vectors_mean_seg, feature_vectors_covinv_seg_area=feature_vectors_covinv_seg_area, feature_vectors_mean_seg_area=feature_vectors_mean_seg_area,
-        q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_eff_start=q_eff_start, q_eff_end=q_eff_end, q_ae_end=q_ae_end, q_seg_start=q_seg_start, q_seg_end=q_seg_end, q_start_mah=q_start_mah, q_end_mah=q_end_mah, desc='Final inference')
-    print('Final image auc: {:.4f}, img {:.4f}, mlp {:.4f}, comp {:.4f}'.format(auc, auc_img, auc_mlp, auc_comp))
+        q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_eff_start=q_eff_start, q_eff_end=q_eff_end, q_ae_end=q_ae_end, q_seg_start=q_seg_start, q_seg_end=q_seg_end, q_start_mah=q_start_mah, q_end_mah=q_end_mah,
+        relation_score_mean=relation_score_mean, relation_score_std=relation_score_std,
+        relation_component_min_area=config.relation_min_component_area,
+        relation_component_connectivity=config.relation_component_connectivity,
+        relation_score_reduction=config.relation_score_reduction,
+        desc='Final inference')
+    print('Final image auc: {:.4f}, img {:.4f}, mlp {:.4f}, comp {:.4f}, relation {:.4f}'.format(auc, auc_img, auc_mlp, auc_comp, auc_rel))
     results = {
         "Iteration": [-1],
         "Category": [config.category],
         "AUC": [auc],
         "AUC Img": [auc_img],
         "AUC Maha": [auc_mlp],
-        "AUC Comp": [auc_comp]
+        "AUC Comp": [auc_comp],
+        "AUC Relation": [auc_rel],
     }
     log(train_output_dir,results)
 

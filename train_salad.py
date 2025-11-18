@@ -7,9 +7,19 @@ from torchvision import transforms
 import itertools
 import os
 import random
+from itertools import combinations
+from typing import List
+
 from tqdm import tqdm
+
 from effad_networks import get_autoencoder, get_pdn_small, get_pdn_medium
-from salad_dataset import ImageFolderWithoutTarget, ImageFolderWithPath, ImageFolderWithoutTargetWithSeg, ImageFolderWithPathWithSeg, InfiniteDataloader
+from salad_dataset import (
+    ImageFolderWithoutTarget,
+    ImageFolderWithPath,
+    ImageFolderWithoutTargetWithSeg,
+    ImageFolderWithPathWithSeg,
+    InfiniteDataloader,
+)
 from sklearn.metrics import roc_auc_score
 from sklearn.covariance import LedoitWolf
 from collections import defaultdict
@@ -21,12 +31,19 @@ from torchvision.ops.focal_loss import sigmoid_focal_loss
 from logger import log
 from dice_loss import DiceLoss
 from argparser import get_argparse
+from models.relation_branch import (
+    Pair,
+    PairRelationModel,
+    build_pair_feature_tensor,
+    extract_components_from_class_map,
+)
 
 # constants
 seed = 42
 on_gpu = torch.cuda.is_available()
 out_channels = 384
 image_size = 256
+num_segmentation_classes = 6
 
 
 default_transform = transforms.Compose([
@@ -131,13 +148,19 @@ def main():
     validation_loader = DataLoader(validation_set, batch_size=1)
     train_loader_infinite = InfiniteDataloader(train_loader)
     # create models
-    
+
     teacher = get_pdn_medium(out_channels=out_channels)
     student = get_pdn_medium(out_channels=2 * out_channels)
     teacher = torch.load(config.weights)
     autoencoder = get_autoencoder(out_channels=out_channels)
     comp_ae = AutoEncoder({})
     comp_unet = UNet({})
+    relation_model = PairRelationModel(
+        num_classes=num_segmentation_classes,
+        class_embedding_dim=config.relation_class_embedding_dim,
+        hidden_dims=config.relation_hidden_dims,
+        dropout=config.relation_dropout,
+    )
 
 
     # teacher frozen
@@ -146,6 +169,7 @@ def main():
     autoencoder.train()
     comp_ae.train()
     comp_unet.train()
+    relation_model.train()
 
     if on_gpu:
         teacher.cuda()
@@ -154,12 +178,19 @@ def main():
         # comp_disc.cuda()
         comp_ae.cuda()
         comp_unet.cuda()
+        relation_model.cuda()
 
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
 
-    optimizer = torch.optim.Adam([{"params": list(student.parameters()) + list(autoencoder.parameters())},
-                                  {"params": list(comp_ae.parameters()) + list(comp_unet.parameters()), "lr":1e-5}],
-                                 lr=1e-4, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(
+        [
+            {"params": list(student.parameters()) + list(autoencoder.parameters())},
+            {"params": list(comp_ae.parameters()) + list(comp_unet.parameters()), "lr": 1e-5},
+            {"params": relation_model.parameters(), "lr": 1e-4},
+        ],
+        lr=1e-4,
+        weight_decay=1e-5,
+    )
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=int(0.95 * config.train_steps), gamma=0.1)
     
@@ -174,6 +205,7 @@ def main():
         force_reload=False
     ).cuda()
     dice_loss_f = DiceLoss(weights).cuda()
+    relation_loss_fn = nn.BCEWithLogitsLoss()
     
     
     train_set.train = True
@@ -184,10 +216,21 @@ def main():
         image_st, image_ae = img
         image_st = normalize(image_st)
         image_ae = normalize(image_ae)
-        anom_seg = torch.cat([anom_seg, seg],dim=0)
-        mask = torch.cat([mask,torch.zeros_like(mask)],dim=0)
-        seg = torch.cat([seg, seg],dim=0)
+        base_seg = seg.clone()
+        base_anom_seg = anom_seg.clone()
+        relation_split_idx = base_anom_seg.shape[0]
+        anom_seg = torch.cat([base_anom_seg, base_seg], dim=0)
+        mask = torch.cat([mask, torch.zeros_like(mask)], dim=0)
+        seg = torch.cat([base_seg, base_seg], dim=0)
         seg = seg.argmax(dim=1)
+        relation_loss = compute_relation_loss_from_batch(
+            anom_seg,
+            relation_split_idx,
+            relation_model,
+            relation_loss_fn,
+            min_component_area=config.relation_min_component_area,
+            component_connectivity=config.relation_component_connectivity,
+        )
         if on_gpu:
             image_st = image_st.cuda()
             image_ae = image_ae.cuda()
@@ -228,9 +271,16 @@ def main():
 
 
         loss_comp_recon = multiclass_focal_loss(seg_recon, seg) + dice_loss_f(seg_recon, seg)
-        loss_comp_mask = 5*focal_loss(pred_mask, mask).mean() + F.l1_loss(nn.Sigmoid()(pred_mask), mask)
+        loss_comp_mask = 5 * focal_loss(pred_mask, mask).mean() + F.l1_loss(nn.Sigmoid()(pred_mask), mask)
 
-        loss_total = loss_st + loss_ae + loss_stae + loss_comp_recon + loss_comp_mask
+        loss_total = (
+            loss_st
+            + loss_ae
+            + loss_stae
+            + loss_comp_recon
+            + loss_comp_mask
+            + config.relation_loss_weight * relation_loss
+        )
 
         optimizer.zero_grad()
         loss_total.backward()
@@ -239,8 +289,13 @@ def main():
 
         if iteration % 10 == 0:
             tqdm_obj.set_description(
-                # "Current loss: {:.4f}".format(loss_total.item()))
-                "Current loss: {:.4f}, comp recon loss {:.4f}, comp disc loss {:.4f}".format(loss_total.item(), loss_comp_recon.item(), loss_comp_mask.item()))
+                "Current loss: {:.4f}, comp recon loss {:.4f}, comp disc loss {:.4f}, relation loss {:.4f}".format(
+                    loss_total.item(),
+                    loss_comp_recon.item(),
+                    loss_comp_mask.item(),
+                    relation_loss.item(),
+                )
+            )
 
 
         if iteration % 10000 == 0:
@@ -254,6 +309,8 @@ def main():
                                                  'comp_autoencoder_tmp.pth'))
             torch.save(comp_unet, os.path.join(train_output_dir,
                                                  'comp_unet_tmp.pth'))
+            torch.save(relation_model, os.path.join(train_output_dir,
+                                                 'relation_model_tmp.pth'))
 
         if iteration % 10000 == 0 and iteration > 0:
             # run intermediate evaluation
@@ -262,6 +319,7 @@ def main():
             autoencoder.eval()
             comp_ae.eval()
             comp_unet.eval()
+            relation_model.eval()
             # comp_disc.eval()
             train_set.train = False
 
@@ -274,14 +332,27 @@ def main():
                 validation_loader=validation_loader, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet,
                 autoencoder=autoencoder, teacher_mean=teacher_mean,
                 teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_ae_end=q_ae_end, desc='Final score normalization')
+            relation_score_mean, relation_score_std = relation_score_normalization(
+                validation_loader=validation_loader,
+                relation_model=relation_model,
+                min_component_area=config.relation_min_component_area,
+                component_connectivity=config.relation_component_connectivity,
+                reduction=config.relation_score_reduction,
+                desc='Intermediate relation score normalization',
+            )
             feature_vectors_mean, feature_vectors_covinv, feature_vectors_mean_seg, feature_vectors_covinv_seg, feature_vectors_mean_seg_area, feature_vectors_covinv_seg_area = extract_features_mahalanobis(train_loader, train_set, student, teacher_mean, teacher_std)
             q_start_mah, q_end_mah = map_normalization_mahalanobis(validation_loader, student, teacher_mean, teacher_std, feature_vectors_covinv, feature_vectors_mean, feature_vectors_covinv_seg, feature_vectors_mean_seg, feature_vectors_covinv_seg_area, feature_vectors_mean_seg_area)
-            auc, auc_img, auc_mlp, auc_comp = test(
-                test_set=test_set, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet,
+            auc, auc_img, auc_mlp, auc_comp, auc_rel = test(
+                test_set=test_set, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet, relation_model=relation_model,
                 autoencoder=autoencoder, teacher_mean=teacher_mean,
                 teacher_std=teacher_std, feature_vectors_covinv=feature_vectors_covinv, feature_vectors_mean=feature_vectors_mean, feature_vectors_covinv_seg=feature_vectors_covinv_seg, feature_vectors_mean_seg=feature_vectors_mean_seg, feature_vectors_covinv_seg_area=feature_vectors_covinv_seg_area, feature_vectors_mean_seg_area=feature_vectors_mean_seg_area,
-                q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_eff_start=q_eff_start, q_eff_end=q_eff_end, q_ae_end=q_ae_end, q_seg_start=q_seg_start, q_seg_end=q_seg_end, q_start_mah=q_start_mah, q_end_mah=q_end_mah, desc='Intermediate inference')
-            print('Intermediate image auc: {:.4f}, img {:.4f}, maha {:.4f}, comp {:.4f}'.format(auc, auc_img, auc_mlp, auc_comp))
+                q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_eff_start=q_eff_start, q_eff_end=q_eff_end, q_ae_end=q_ae_end, q_seg_start=q_seg_start, q_seg_end=q_seg_end, q_start_mah=q_start_mah, q_end_mah=q_end_mah,
+                relation_score_mean=relation_score_mean, relation_score_std=relation_score_std,
+                relation_component_min_area=config.relation_min_component_area,
+                relation_component_connectivity=config.relation_component_connectivity,
+                relation_score_reduction=config.relation_score_reduction,
+                desc='Intermediate inference')
+            print('Intermediate image auc: {:.4f}, img {:.4f}, maha {:.4f}, comp {:.4f}, relation {:.4f}'.format(auc, auc_img, auc_mlp, auc_comp, auc_rel))
 
             results = {
                 "Iteration": [iteration],
@@ -289,7 +360,8 @@ def main():
                 "AUC": [auc],
                 "AUC Img": [auc_img],
                 "AUC Maha": [auc_mlp],
-                "AUC Comp": [auc_comp]
+                "AUC Comp": [auc_comp],
+                "AUC Relation": [auc_rel],
             }
             log(train_output_dir,results)
             # teacher frozen
@@ -298,6 +370,7 @@ def main():
             autoencoder.train()
             comp_ae.train()
             comp_unet.train()
+            relation_model.train()
             train_set.train = True
 
     train_set.train = False
@@ -306,6 +379,7 @@ def main():
     autoencoder.eval()
     comp_ae.eval()
     comp_unet.eval()
+    relation_model.eval()
 
     torch.save(teacher, os.path.join(train_output_dir, 'teacher_final.pth'))
     torch.save(student, os.path.join(train_output_dir, 'student_final.pth'))
@@ -315,6 +389,8 @@ def main():
                                                  'comp_autoencoder_final.pth'))
     torch.save(comp_unet, os.path.join(train_output_dir,
                                             'comp_unet_final.pth'))
+    torch.save(relation_model, os.path.join(train_output_dir,
+                                            'relation_model_final.pth'))
 
 
     q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
@@ -325,34 +401,50 @@ def main():
         validation_loader=validation_loader, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet,
         autoencoder=autoencoder, teacher_mean=teacher_mean,
         teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_ae_end=q_ae_end, desc='Final score normalization')
+    relation_score_mean, relation_score_std = relation_score_normalization(
+        validation_loader=validation_loader,
+        relation_model=relation_model,
+        min_component_area=config.relation_min_component_area,
+        component_connectivity=config.relation_component_connectivity,
+        reduction=config.relation_score_reduction,
+        desc='Final relation score normalization',
+    )
     feature_vectors_mean, feature_vectors_covinv, feature_vectors_mean_seg, feature_vectors_covinv_seg, feature_vectors_mean_seg_area, feature_vectors_covinv_seg_area = extract_features_mahalanobis(train_loader, train_set, student, teacher_mean, teacher_std)
     q_start_mah, q_end_mah = map_normalization_mahalanobis(validation_loader, student, teacher_mean, teacher_std, feature_vectors_covinv, feature_vectors_mean, feature_vectors_covinv_seg, feature_vectors_mean_seg, feature_vectors_covinv_seg_area, feature_vectors_mean_seg_area)
-    auc, auc_img, auc_mlp, auc_comp = test(
-        test_set=test_set, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet,
+    auc, auc_img, auc_mlp, auc_comp, auc_rel = test(
+        test_set=test_set, teacher=teacher, student=student, comp_ae=comp_ae, comp_unet=comp_unet, relation_model=relation_model,
         autoencoder=autoencoder, teacher_mean=teacher_mean,
         teacher_std=teacher_std, feature_vectors_covinv=feature_vectors_covinv, feature_vectors_mean=feature_vectors_mean, feature_vectors_covinv_seg=feature_vectors_covinv_seg, feature_vectors_mean_seg=feature_vectors_mean_seg, feature_vectors_covinv_seg_area=feature_vectors_covinv_seg_area, feature_vectors_mean_seg_area=feature_vectors_mean_seg_area,
-        q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_eff_start=q_eff_start, q_eff_end=q_eff_end, q_ae_end=q_ae_end, q_seg_start=q_seg_start, q_seg_end=q_seg_end, q_start_mah=q_start_mah, q_end_mah=q_end_mah, desc='Final inference')
-    print('Final image auc: {:.4f}, img {:.4f}, maha {:.4f}, comp {:.4f}'.format(auc, auc_img, auc_mlp, auc_comp))
+        q_st_start=q_st_start, q_st_end=q_st_end, q_ae_start=q_ae_start, q_eff_start=q_eff_start, q_eff_end=q_eff_end, q_ae_end=q_ae_end, q_seg_start=q_seg_start, q_seg_end=q_seg_end, q_start_mah=q_start_mah, q_end_mah=q_end_mah,
+        relation_score_mean=relation_score_mean, relation_score_std=relation_score_std,
+        relation_component_min_area=config.relation_min_component_area,
+        relation_component_connectivity=config.relation_component_connectivity,
+        relation_score_reduction=config.relation_score_reduction,
+        desc='Final inference')
+    print('Final image auc: {:.4f}, img {:.4f}, maha {:.4f}, comp {:.4f}, relation {:.4f}'.format(auc, auc_img, auc_mlp, auc_comp, auc_rel))
     results = {
         "Iteration": [iteration],
         "Category": [config.category],
         "AUC": [auc],
         "AUC Img": [auc_img],
         "AUC Maha": [auc_mlp],
-        "AUC Comp": [auc_comp]
+        "AUC Comp": [auc_comp],
+        "AUC Relation": [auc_rel],
     }
     log(train_output_dir,results)
 
-def test(test_set, teacher, student, autoencoder, comp_ae, comp_unet, 
+def test(test_set, teacher, student, autoencoder, comp_ae, comp_unet, relation_model,
          teacher_mean, teacher_std,
          feature_vectors_covinv, feature_vectors_mean, feature_vectors_covinv_seg, feature_vectors_mean_seg, feature_vectors_covinv_seg_area, feature_vectors_mean_seg_area,
          q_st_start, q_st_end, q_ae_start, q_ae_end, q_eff_start, q_eff_end, q_seg_start, q_seg_end, q_start_mah, q_end_mah,
+         relation_score_mean, relation_score_std, relation_component_min_area, relation_component_connectivity, relation_score_reduction,
          desc='Running inference'):
     y_true = {"good":[],"logical_anomalies":[],"structural_anomalies":[]}
     y_score_no_mah = {"good":[],"logical_anomalies":[],"structural_anomalies":[]}
     y_score_mah = {"good":[],"logical_anomalies":[],"structural_anomalies":[]}
     y_score_comp = {"good":[],"logical_anomalies":[],"structural_anomalies":[]}
     y_score = {"good":[],"logical_anomalies":[],"structural_anomalies":[]}
+    y_score_rel = {"good":[],"logical_anomalies":[],"structural_anomalies":[]}
     y_score_mah_all = []
     y_score_no_mah_all = []
     for image, seg, target, path in tqdm(test_set, desc=desc):
@@ -376,17 +468,28 @@ def test(test_set, teacher, student, autoencoder, comp_ae, comp_unet,
         map_comp = map_comp[0, 0].cpu().numpy()
 
 
+        relation_score = predict_relation_score(
+            seg,
+            relation_model,
+            relation_score_mean,
+            relation_score_std,
+            min_component_area=relation_component_min_area,
+            component_connectivity=relation_component_connectivity,
+            reduction=relation_score_reduction,
+        )
+
         mahalanobis_score = predict_mahalanobis(image=image, seg=seg, teacher=student, teacher_mean=teacher_mean, feature_vectors_covinv=feature_vectors_covinv, feature_vectors_mean=feature_vectors_mean, feature_vectors_covinv_seg=feature_vectors_covinv_seg, feature_vectors_mean_seg=feature_vectors_mean_seg, feature_vectors_covinv_seg_area=feature_vectors_covinv_seg_area, feature_vectors_mean_seg_area=feature_vectors_mean_seg_area,
             teacher_std=teacher_std, q_start=q_start_mah, q_end=q_end_mah)
         defect_class = os.path.basename(os.path.dirname(path))
 
         y_true_image = 0 if defect_class == 'good' else 1
-        y_score_image = np.max(map_combined) + mahalanobis_score + np.max(map_comp)
+        y_score_image = np.max(map_combined) + mahalanobis_score + np.max(map_comp) + relation_score
         y_score_img_no_mlp = np.max(map_combined)
         y_true[defect_class].append(y_true_image)
         y_score_mah[defect_class].append(mahalanobis_score)
         y_score_no_mah[defect_class].append(y_score_img_no_mlp)
         y_score_comp[defect_class].append(np.max(map_comp))
+        y_score_rel[defect_class].append(relation_score)
         y_score[defect_class].append(y_score_image)
 
         y_score_mah_all.append(mahalanobis_score)
@@ -404,14 +507,18 @@ def test(test_set, teacher, student, autoencoder, comp_ae, comp_unet,
     auc_log_comp = roc_auc_score(y_true=y_true['good']+y_true['logical_anomalies'], y_score=y_score_comp['good'] + y_score_comp['logical_anomalies'])
     auc_str_comp = roc_auc_score(y_true=y_true['good']+y_true['structural_anomalies'], y_score=y_score_comp['good']+y_score_comp['structural_anomalies'])
     auc_comp = 0.5*(auc_log_comp+auc_str_comp)
+    auc_log_rel = roc_auc_score(y_true=y_true['good']+y_true['logical_anomalies'], y_score=y_score_rel['good'] + y_score_rel['logical_anomalies'])
+    auc_str_rel = roc_auc_score(y_true=y_true['good']+y_true['structural_anomalies'], y_score=y_score_rel['good']+y_score_rel['structural_anomalies'])
+    auc_relation = 0.5*(auc_log_rel+auc_str_rel)
 
     print("AUC Scores for different parts")
     print(f"All Logical: {auc_log*100}, Struct: {auc_str*100}")
     print(f"Maha Logical: {auc_log_mah*100}, Struct: {auc_str_mah*100}")
     print(f"Img Logical: {auc_log_no_mah*100}, Struct: {auc_str_no_mah*100}")
     print(f"Comp Logical: {auc_log_comp*100}, Struct: {auc_str_comp*100}")
+    print(f"Relation Logical: {auc_log_rel*100}, Struct: {auc_str_rel*100}")
     print("")
-    return auc * 100, auc_img * 100 , auc_mlp * 100, auc_comp*100
+    return auc * 100, auc_img * 100 , auc_mlp * 100, auc_comp*100, auc_relation * 100
 
 @torch.no_grad()
 def predict_comp_map(seg, comp_ae, comp_unet):
@@ -676,6 +783,135 @@ def map_normalization_mahalanobis(validation_loader, teacher,
         q_end[k] = np.std(maps_k)#torch.quantile(maps_k, q=0.995)
 
     return q_start, q_end
+
+
+def _pairs_from_class_maps(
+    class_maps: torch.Tensor,
+    image_index_offset: int = 0,
+    min_component_area: int = 10,
+    component_connectivity: int = 1,
+) -> List[Pair]:
+    pairs: List[Pair] = []
+    for idx, class_map in enumerate(class_maps):
+        components = extract_components_from_class_map(
+            class_map.cpu(),
+            image_index=idx + image_index_offset,
+            min_area=min_component_area,
+            connectivity=component_connectivity,
+        )
+        if len(components) < 2:
+            continue
+        pairs.extend(list(combinations(components, 2)))
+    return pairs
+
+
+def compute_relation_loss_from_batch(
+    seg_batch,
+    split_idx,
+    relation_model,
+    criterion,
+    min_component_area: int = 10,
+    component_connectivity: int = 1,
+):
+    device = next(relation_model.parameters()).device
+    if seg_batch.ndim != 4 or split_idx <= 0:
+        return torch.tensor(0.0, device=device)
+    class_maps = seg_batch.argmax(dim=1)
+    negative_maps = class_maps[:split_idx]
+    positive_maps = class_maps[split_idx:]
+    positive_pairs = _pairs_from_class_maps(
+        positive_maps,
+        image_index_offset=split_idx,
+        min_component_area=min_component_area,
+        component_connectivity=component_connectivity,
+    )
+    negative_pairs = _pairs_from_class_maps(
+        negative_maps,
+        image_index_offset=0,
+        min_component_area=min_component_area,
+        component_connectivity=component_connectivity,
+    )
+    features: List[torch.Tensor] = []
+    labels: List[torch.Tensor] = []
+    if positive_pairs:
+        pos_features = build_pair_feature_tensor(
+            positive_pairs,
+            relation_model.class_embedding,
+            device=device,
+        )
+        features.append(pos_features)
+        labels.append(torch.ones(pos_features.shape[0], device=device))
+    if negative_pairs:
+        neg_features = build_pair_feature_tensor(
+            negative_pairs,
+            relation_model.class_embedding,
+            device=device,
+        )
+        features.append(neg_features)
+        labels.append(torch.zeros(neg_features.shape[0], device=device))
+    if not features:
+        return torch.tensor(0.0, device=device)
+    features_tensor = torch.cat(features, dim=0)
+    labels_tensor = torch.cat(labels, dim=0)
+    logits = relation_model(features_tensor)
+    return criterion(logits, labels_tensor)
+
+
+@torch.no_grad()
+def relation_score_normalization(
+    validation_loader,
+    relation_model,
+    min_component_area: int = 10,
+    component_connectivity: int = 1,
+    reduction: str = 'mean',
+    desc='Relation score normalization',
+):
+    scores = []
+    device = next(relation_model.parameters()).device
+    for _, seg, _, _, _ in tqdm(validation_loader, desc=desc):
+        seg_map = seg[0].argmax(dim=0)
+        components = extract_components_from_class_map(
+            seg_map.cpu(),
+            image_index=0,
+            min_area=min_component_area,
+            connectivity=component_connectivity,
+        )
+        _, agg = relation_model.score_image(components, reduction=reduction, device=device)
+        score = 1.0 - float(agg.item())
+        scores.append(score)
+    if not scores:
+        return 0.0, 1.0
+    return float(np.mean(scores)), float(np.std(scores) + 1e-6)
+
+
+@torch.no_grad()
+def predict_relation_score(
+    seg,
+    relation_model,
+    score_mean=None,
+    score_std=None,
+    min_component_area: int = 10,
+    component_connectivity: int = 1,
+    reduction: str = 'mean',
+):
+    device = next(relation_model.parameters()).device
+    if seg.ndim == 4:
+        seg = seg[0]
+    seg_map = seg.detach().cpu().argmax(dim=0)
+    components = extract_components_from_class_map(
+        seg_map,
+        image_index=0,
+        min_area=min_component_area,
+        connectivity=component_connectivity,
+    )
+    if not components:
+        base_score = 0.0
+    else:
+        _, agg = relation_model.score_image(components, reduction=reduction, device=device)
+        base_score = 1.0 - float(agg.item())
+    if score_mean is not None and score_std is not None and score_std > 0:
+        return (base_score - score_mean) / score_std
+    return base_score
 
 @torch.no_grad
 def get_weights(train_loader):
